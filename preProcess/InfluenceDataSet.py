@@ -22,6 +22,7 @@ from torch_geometric.data import Data
 import networkx as nx
 from torch_geometric.utils import to_networkx
 import torch_geometric as pyg
+import torch_geometric.nn.conv as gconv
 
 random.seed(9527)
 np.random.seed(9527)
@@ -39,20 +40,24 @@ class InfluenceDataSet:
         self.edges_data = edges_data
         # 用户id与节点的id映射
         src, dst = self.__dict(edges_data[src_index].to_numpy(), edges_data[dst_index].to_numpy())
-        edges_tensor = torch.tensor(np.array([src, dst]), dtype=torch.int32)
+        edges_tensor = torch.tensor(np.array([src, dst]), dtype=torch.long)
         print(edges_tensor)
         # self.dgl_graph = dgl.graph((src, dst), idtype=torch.int32)
         # self.pyg_graph.ndata['status'] = torch.zeros(self.dgl_graph.number_of_nodes(), dtype=torch.int8)
-        self.pyg_graph = Data(edge_index=edges_tensor, transform=pyg_T.ToSparseTensor())  # pyg图
+        self.pyg_graph = Data(edge_index=edges_tensor, transform=pyg_T.ToSparseTensor(remove_edge_index=False))  # pyg图
+
         # 初始没有节点被感染, 将所有节点的状态设置为 易感者（S）:0
         if num_nodes > 0 and num_nodes > len(self.id2node):
             self.pyg_graph.num_nodes = num_nodes
         else:
             self.pyg_graph.num_nodes = len(self.id2node)
-            if(num_nodes > 0):
+            if num_nodes > 0:
                 print('UserWarning: the number of nodes that you input(%d) is too less\nThere are %d nodes indeed.' % (num_nodes, len(self.id2node)))
-        status_tensor = torch.zeros(self.pyg_graph.num_nodes, dtype=torch.int8)
-        self.pyg_graph.x = status_tensor
+        status_matrix = torch.zeros(self.pyg_graph.num_nodes, 3, dtype=torch.int8)  # SIR矩阵[num_nodes * 3]
+        # ones_column = torch.ones(self.pyg_graph.num_nodes, 1)
+        # status_matrix[:, 0] = ones_column[:, 0]   # 将第0列赋值为1
+        self.pyg_graph.x = status_matrix
+        self.pyg_graph.transform(self.pyg_graph)  # <- 将edge_index转换为稀疏矩阵
 
     def __dict(self, arr_1: np.ndarray, arr_2: np.ndarray) -> dict:
         # TODO
@@ -111,8 +116,9 @@ class InfluenceDataSet:
         # 统计各个状态（S、I、R）的节点数目
 
         # s_num, i_num, r_num = self.dgl_graph.ndata['status'].bincount().tolist()
-        static_list = self.pyg_graph.x.bincount().tolist()
-        s_num, i_num, r_num = static_list + [0] * (3 - len(static_list))
+        # static_list = self.pyg_graph.x.bincount().tolist()
+        # s_num, i_num, r_num = static_list + [0] * (3 - len(static_list))
+        s_num, i_num, r_num = self.pyg_graph.x.sum(dim=0).tolist()
         return s_num, i_num, r_num
 
     def __pyg_get_neighbors(self, node: int, directed: str = 'undirected') -> torch.tensor:
@@ -132,7 +138,7 @@ class InfluenceDataSet:
             neighbors = torch.unique(neighbors, return_inverse=False, return_counts=False)
         return neighbors
 
-    def update_node_status(self, node, beta, gamma):
+    def update_node_status(self, beta, gamma):
         """
         更新节点状态
         :param self.graph: 网络图
@@ -142,26 +148,75 @@ class InfluenceDataSet:
         """
         # TODO
         # 如果当前节点状态为 感染者(I) 有概率gamma变为 免疫者(R)
-        if self.pyg_graph.x[node] == const.I:
-            p = random.random()
-            if p < gamma:
-                self.pyg_graph.x[node] = const.R
-        # 如果当前节点状态为 易感染者(S) 有概率beta变为 感染者(I)
-        if self.pyg_graph.x[node] == const.S:
-            # 获取当前节点的邻居节点
-            # 无向图：G.neighbors(node)
-            # 有向图：G.predecessors(node)，前驱邻居节点，即指向该节点的节点；G.successors(node)，后继邻居节点，即该节点指向的节点。
-            # neighbors = list(graph.predecessors(node))
+        p_R = torch.rand(self.pyg_graph.num_nodes, 1)
+        ones_column = torch.ones(self.pyg_graph.num_nodes, 1)  # 创建一个大小为(n, 1)且填充为1的tensor
+        # zeros_column = torch.zeros(self.pyg_graph.num_nodes, 1)  # 创建一个大小为(n, 1)且填充为0的tensor
+        p_R = torch.cat((ones_column, p_R, ones_column), dim=1)
+        self.pyg_graph.x = p_R * self.pyg_graph.x
+        i_old_tensor = self.pyg_graph.x[:, 1]
+        condition_r = (i_old_tensor > 0) & (i_old_tensor < gamma)
+        r_new_tensor = torch.where(condition_r, 1, 0)
+        i_new_tensor = torch.where(condition_r, 0, i_old_tensor)
+        self.pyg_graph.x[:, 2] = self.pyg_graph.x[:, 2] + r_new_tensor
+        self.pyg_graph.x[:, 1] = i_new_tensor
+        condition_i_r = (i_new_tensor > 0) & (i_new_tensor < 1)
+        i_new_tensor = torch.where(condition_i_r, 1, i_new_tensor)
+        self.pyg_graph.x[:, 1] = i_new_tensor
+        self.pyg_graph.x = self.pyg_graph.x.type(torch.int8)    # 计算时自动转化为float了, 得把类型转换回来
 
-            neighbors = self.__pyg_get_neighbors(node).tolist()
-            # 对当前节点的邻居节点进行遍历
-            for neighbor in neighbors:
-                # 邻居节点中存在 感染者(I)，则该节点有概率被感染为 感染者(I)
-                if self.pyg_graph.x[neighbor] == const.I:
-                    p = random.random()
-                    if p < beta:
-                        self.pyg_graph.x[neighbor] = const.I
-                        break
+        # TODO
+        # 如果当前节点状态为 易感染者(S) 有概率beta变为 感染者(I)
+
+        S_tensor = self.pyg_graph.x[:, 0]
+        S_tensor = S_tensor.reshape(self.pyg_graph.num_nodes, 1)
+        # S_matrix = S_tensor.expand(self.pyg_graph.num_nodes, self.pyg_graph.num_nodes)
+
+        sparse_tensor = self.pyg_graph.adj_t.detach().to_torch_sparse_coo_tensor()
+
+        S_matrix = sparse_tensor * S_tensor
+
+        row = S_matrix._indices()[0]
+        col = S_matrix._indices()[1]
+        data = S_matrix._values()
+        shape = S_matrix.size()
+        S_coo_matrix = sp.coo_matrix((data, (row, col)), shape=shape)
+        rows, cols = S_coo_matrix.sum(axis=1).nonzero()
+        # 生成num_nonzero_raw行概率矩阵P num_nodes * num_nodes 但是要稀疏矩阵
+        # 随机生成(非零行 x num_nodes) 的非零元素
+        values = torch.rand(len(rows) * self.pyg_graph.num_nodes)
+        # 指定非零元素所在的行号
+        row_indices = torch.tensor(rows)
+        # 创建列号的范围 [0, 1, 2,..., num_nodes]
+        col_indices = torch.arange(self.pyg_graph.num_nodes)
+        # 将行号和列号组合成 indices
+        indices = torch.stack([row_indices.repeat_interleave(self.pyg_graph.num_nodes), col_indices.repeat(len(rows))])
+        # 创建稀疏矩阵
+        p_r_coo_matrix = torch.sparse_coo_tensor(indices, values, size=[self.pyg_graph.num_nodes, self.pyg_graph.num_nodes])
+
+        i_matrix = S_matrix * p_r_coo_matrix
+
+        nonzero_i_coo_tensor = i_matrix.index_select(dim=0, index=row_indices)
+        nonzero_i_tensor = nonzero_i_coo_tensor.to_dense()
+
+        ones_row = torch.ones(nonzero_i_tensor.shape[0], self.pyg_graph.num_nodes)  # nonzero_rows * num_nodes
+        zeros_row = torch.zeros(nonzero_i_tensor.shape[0], self.pyg_graph.num_nodes)
+
+        i_condition = (nonzero_i_tensor > 0) & (nonzero_i_tensor < beta)
+        nonzero_i_tensor = torch.where(i_condition, ones_row, zeros_row)
+        i_status_index = torch.where(nonzero_i_tensor.sum(dim=1) > 0, row_indices, -1)
+
+        i_status_index = i_status_index[i_status_index >= 0]
+
+        self.pyg_graph.x[i_status_index, 1] = 1
+        self.pyg_graph.x[i_status_index, 0] = 0
+
+    def __init_x(self):
+        self.pyg_graph.x = torch.zeros(self.pyg_graph.num_nodes, 3, dtype=torch.int8)
+        self.pyg_graph.x[:, 0] = torch.ones(self.pyg_graph.num_nodes, dtype=torch.int8)
+
+    def __set_i_seeds(self, seed_set: list):
+        self.pyg_graph.x[seed_set, 0] = 0
+        self.pyg_graph.x[seed_set, 1] = 1
 
     def SIR_network(self, source, beta, gamma, step):
         """
@@ -175,29 +230,30 @@ class InfluenceDataSet:
         n = self.pyg_graph.num_nodes  # 网络节点个数
         sir_values = []  # 存储每一次迭代后网络中感染节点数I+免疫节点数R的总和
         # 初始化节点状态
-        for node in range(n):
-            self.pyg_graph.x[node] = const.S  # 将所有节点的状态设置为 易感者（S）
+        # 将所有节点的状态设置为 易感者（S）
+        self.__init_x()
         # 设置初始感染源
-        for node in source:
-            self.pyg_graph.x[node] = const.I  # 将感染源序列中的节点设置为感染源，状态设置为 感染者（I）
+        # 将感染源序列中的节点设置为感染源，状态设置为 感染者（I）
+        self.__set_i_seeds(source)
         # 记录初始状态
         sir_values.append(len(source) / n)
         # 开始迭代感染
         for s in range(step):
             # 针对对每个节点进行状态更新以完成本次迭代
-            if gamma >= 1:  # 如果gamma=1，开启上一轮迭代的感染节点全部会变免疫的模式
-                last_I_nodes = []
-                for node in range(n):  # 记录这轮迭代未开始时的被感染节点I
-                    if self.pyg_graph.x[node] == const.I:
-                        last_I_nodes.append(node)
-            for node in range(n):
-                self.update_node_status(node, beta, gamma)  # 针对node号节点进行SIR过程
+            # if gamma >= 1:  # 如果gamma=1，开启上一轮迭代的感染节点全部会变免疫的模式
+            #     last_I_nodes = []
+            #     for node in range(n):  # 记录这轮迭代未开始时的被感染节点I
+            #         if self.pyg_graph.x[node] == const.I:
+            #             last_I_nodes.append(node)
+
+            self.update_node_status(beta, gamma)  # 针对node号节点进行SIR过程
+            print('已迭代%d轮' % step)
             s, i, r = self.get_node_status()  # 得到本次迭代结束后各个状态（S、I、R）的节点数目
             sir = (i + r) / n  # 该节点的sir值为迭代结束后 感染节点数i+免疫节点数r
             sir_values.append(sir)  # 将本次迭代的sir值加入数组
-            if gamma >= 1:  # 如果gamma=1，开启上一轮迭代的感染节点全部会变免疫的模式
-                for node in last_I_nodes:
-                    self.pyg_graph.x[node] = const.R  # 将上一轮感染源序列中的节点设置为恢复者，状态设置为 恢复者（R）
+            # if gamma >= 1:  # 如果gamma=1，开启上一轮迭代的感染节点全部会变免疫的模式
+            #     for node in last_I_nodes:
+            #         self.pyg_graph.x[node] = const.R  # 将上一轮感染源序列中的节点设置为恢复者，状态设置为 恢复者（R）
 
         return sir_values
 
