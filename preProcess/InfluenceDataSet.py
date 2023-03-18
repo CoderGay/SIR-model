@@ -21,6 +21,7 @@ import torch_geometric.transforms as pyg_T
 from torch_geometric.data import Data
 import networkx as nx
 from torch_geometric.utils import to_networkx
+from torch_geometric.utils import from_networkx
 import torch_geometric as pyg
 import torch_geometric.nn.conv as gconv
 
@@ -35,8 +36,59 @@ pyg.seed_everything(9527)
 
 class InfluenceDataSet:
 
-    def __init__(self, edges_data: pd.DataFrame, src_index: str = 'user_id', dst_index: str = 'friend_id',
-                 num_nodes: int = 0):
+    # def __init__(self, edges_data: pd.DataFrame, src_index: str = 'user_id', dst_index: str = 'friend_id',
+    #              num_nodes: int = 0):
+    #     self.edges_data = edges_data
+    #     # 用户id与节点的id映射
+    #     src, dst = self.__dict(edges_data[src_index].to_numpy(), edges_data[dst_index].to_numpy())
+    #     edges_tensor = torch.tensor(np.array([src, dst]), dtype=torch.long)
+    #     print(edges_tensor)
+    #     # self.dgl_graph = dgl.graph((src, dst), idtype=torch.int32)
+    #     # self.pyg_graph.ndata['status'] = torch.zeros(self.dgl_graph.number_of_nodes(), dtype=torch.int8)
+    #     self.pyg_graph = Data(edge_index=edges_tensor, transform=pyg_T.ToSparseTensor(remove_edge_index=False))  # pyg图
+    #
+    #     # 初始没有节点被感染, 将所有节点的状态设置为 易感者（S）:0
+    #     if num_nodes > 0 and num_nodes > len(self.id2node):
+    #         self.pyg_graph.num_nodes = num_nodes
+    #     else:
+    #         self.pyg_graph.num_nodes = len(self.id2node)
+    #         if num_nodes > 0:
+    #             print('UserWarning: the number of nodes that you input(%d) is too less\nThere are %d nodes indeed.' % (num_nodes, len(self.id2node)))
+    #     status_matrix = torch.zeros(self.pyg_graph.num_nodes, 3, dtype=torch.int8)  # SIR矩阵[num_nodes * 3]
+    #     # ones_column = torch.ones(self.pyg_graph.num_nodes, 1)
+    #     # status_matrix[:, 0] = ones_column[:, 0]   # 将第0列赋值为1
+    #     self.pyg_graph.x = status_matrix
+    #     self.pyg_graph.transform(self.pyg_graph)  # <- 将edge_index转换为稀疏矩阵
+    def __init__(self, data_source, num_nodes: int = 0):
+
+        if isinstance(data_source, pd.DataFrame):
+            data = self.from_pd(data_source)
+            if num_nodes > 0 and num_nodes > len(self.id2node):
+                data.num_nodes = num_nodes
+            else:
+                data.num_nodes = len(self.id2node)
+                if num_nodes > 0:
+                    print(
+                        'UserWarning: the number of nodes that you input(%d) is too less\nThere are %d nodes indeed.' % (
+                        num_nodes, len(self.id2node)))
+        else:
+            data = self.from_netwokrx(data_source)
+
+        # 初始没有节点被感染, 将所有节点的状态设置为 易感者（S）:0
+        print(data)
+        status_matrix = torch.zeros(data.num_nodes, 3, dtype=torch.int8)  # SIR矩阵[num_nodes * 3]
+        # ones_column = torch.ones(self.pyg_graph.num_nodes, 1)
+        # status_matrix[:, 0] = ones_column[:, 0]   # 将第0列赋值为1
+        data.x = status_matrix
+        data.transform(data)
+        self.pyg_graph = data
+
+    def from_netwokrx(self, nx_graph):
+        data = from_networkx(nx_graph)
+        data.transform = pyg_T.ToSparseTensor(remove_edge_index=False)
+        return data
+
+    def from_pd(self, edges_data: pd.DataFrame, src_index: str = 'user_id', dst_index: str = 'friend_id'):
         self.edges_data = edges_data
         # 用户id与节点的id映射
         src, dst = self.__dict(edges_data[src_index].to_numpy(), edges_data[dst_index].to_numpy())
@@ -44,20 +96,9 @@ class InfluenceDataSet:
         print(edges_tensor)
         # self.dgl_graph = dgl.graph((src, dst), idtype=torch.int32)
         # self.pyg_graph.ndata['status'] = torch.zeros(self.dgl_graph.number_of_nodes(), dtype=torch.int8)
-        self.pyg_graph = Data(edge_index=edges_tensor, transform=pyg_T.ToSparseTensor(remove_edge_index=False))  # pyg图
-
-        # 初始没有节点被感染, 将所有节点的状态设置为 易感者（S）:0
-        if num_nodes > 0 and num_nodes > len(self.id2node):
-            self.pyg_graph.num_nodes = num_nodes
-        else:
-            self.pyg_graph.num_nodes = len(self.id2node)
-            if num_nodes > 0:
-                print('UserWarning: the number of nodes that you input(%d) is too less\nThere are %d nodes indeed.' % (num_nodes, len(self.id2node)))
-        status_matrix = torch.zeros(self.pyg_graph.num_nodes, 3, dtype=torch.int8)  # SIR矩阵[num_nodes * 3]
-        # ones_column = torch.ones(self.pyg_graph.num_nodes, 1)
-        # status_matrix[:, 0] = ones_column[:, 0]   # 将第0列赋值为1
-        self.pyg_graph.x = status_matrix
-        self.pyg_graph.transform(self.pyg_graph)  # <- 将edge_index转换为稀疏矩阵
+        transform = pyg_T.ToSparseTensor(remove_edge_index=False)
+        data = Data(edge_index=edges_tensor, transform=transform)  # pyg图
+        return data
 
     def __dict(self, arr_1: np.ndarray, arr_2: np.ndarray) -> dict:
         # TODO
@@ -247,7 +288,7 @@ class InfluenceDataSet:
             #             last_I_nodes.append(node)
 
             self.update_node_status(beta, gamma)  # 针对node号节点进行SIR过程
-            print('已迭代%d轮' % step)
+            # print('已迭代%d轮' % step)
             s, i, r = self.get_node_status()  # 得到本次迭代结束后各个状态（S、I、R）的节点数目
             sir = (i + r) / n  # 该节点的sir值为迭代结束后 感染节点数i+免疫节点数r
             sir_values.append(sir)  # 将本次迭代的sir值加入数组
@@ -271,9 +312,11 @@ if __name__ == '__main__':
     # 对其中一个列名重新设置
     # edges_data.rename(columns={'data':'DATA'})
     print(edges_pd_data)
-    number_of_nodes = 139409  # the number of node in friendship is 71,367, but voted by 139,409 users
-
-    diggDataSet = InfluenceDataSet(edges_pd_data, 'user_id', 'friend_id', number_of_nodes)
+    # number_of_nodes = 139409  # the number of node in friendship is 71,367, but voted by 139,409 users
+    number_of_nodes = 115
+    nx_g_karate = nx.read_gml(r'../data/raw_data/football/football.gml', label='id')
+    diggDataSet = InfluenceDataSet(nx_g_karate, number_of_nodes)
+    # diggDataSet = InfluenceDataSet(edges_pd_data, 'user_id', 'friend_id', number_of_nodes)
     print(diggDataSet.pyg_graph)
     # diggDataSet.visualize_graph(diggDataSet.pyg_graph.x)
 
@@ -291,7 +334,7 @@ if __name__ == '__main__':
         sir_list = []
         for k in range(n):
             # SIR参数设置，可自行设置
-            beta = 0.1  # 感染率 0.5
+            beta = 0.001  # 感染率 0.5
             gamma = 1  # 免疫率 0.1
             step = 100  # SIR模型中的感染传播轮次
             # 节点的感染情况
@@ -316,4 +359,4 @@ if __name__ == '__main__':
     '''
     输出到文件。更换为自己的数据文件！！！
     '''
-    dfSIR.to_csv('./result/Node-SIR.csv', index=False)
+    dfSIR.to_csv('../result/Node-SIR.csv', index=False)
